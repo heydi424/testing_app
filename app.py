@@ -1,11 +1,11 @@
 # app.py
-# Legal Aid Analytics — Auto DS Workflow (no prior knowledge of columns)
-# ---------------------------------------------------------------------
-# Run locally:  streamlit run app.py
-# Deploy: Streamlit Community Cloud (keep runtime.txt = python-3.11)
+# Legal Aid Analytics — Automated Cleaning, Analysis, External Join + Q&A
+# -----------------------------------------------------------------------
+# Deploy: Streamlit Community Cloud
+# runtime.txt  ->  python-3.11
+# requirements ->  see bottom of this message
 
-import io
-import re
+import io, re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -16,25 +16,25 @@ import streamlit as st
 import folium
 from streamlit.components.v1 import html as st_html
 
-# Optional: fuzzy header matching (if installed)
+# Optional fuzzy header suggestions
 try:
     from rapidfuzz import process as fuzz_process
     HAS_FUZZ = True
 except Exception:
     HAS_FUZZ = False
 
+# Optional SQL for Q&A
+try:
+    import duckdb  # used only in "SQL mode" in Q&A
+    HAS_DUCKDB = True
+except Exception:
+    HAS_DUCKDB = False
+
 st.set_page_config(page_title="Legal Aid Analytics", page_icon="⚖️", layout="wide")
 
 # -------------------------
-# Roles & cleaning config
+# Role dictionary & cleaning rules
 # -------------------------
-DEPT_OPTIONS = [
-    "All Departments",
-    "Family", "Expungement", "Consumer Law",
-    "Tenant Rights & Housing", "Administrative Law",
-    "Outreach", "Marketing", "Language Access",
-]
-
 STANDARD_ROLES = [
     "client_id","department","legal_issue","opened_date","closed_date",
     "zip","city","county","state","language","event_type","event_date",
@@ -43,29 +43,29 @@ STANDARD_ROLES = [
 ]
 
 ROLE_SYNONYMS = {
-    "client_id": ["client id","clientid","person_id","case_client_id","id","case id","caseid"],
-    "department": ["dept","unit","program","service_area"],
-    "legal_issue": ["issue","case_type","matter","topic","legal_issue","problem","reason"],
-    "opened_date": ["open date","intake_date","created","start_date","date_opened","filed"],
-    "closed_date": ["close date","resolved","end_date","date_closed","closed"],
-    "zip": ["zipcode","postal","postal_code","zip_code","zip5"],
+    "client_id": ["client id","clientid","case id","caseid","person_id","id"],
+    "department": ["dept","unit","program","service_area","team"],
+    "legal_issue": ["issue","case_type","matter","topic","problem","reason"],
+    "opened_date": ["open date","intake_date","created","start_date","date_opened","filed","start"],
+    "closed_date": ["close date","resolved","end_date","date_closed","closed","end"],
+    "zip": ["zipcode","postal","postal_code","zip_code","zip5","code5","postal5"],
     "city": ["municipality","town"],
-    "county": ["parish","borough"],
-    "state": ["province","state_code","st"],
-    "language": ["primary_language","lang"],
-    "event_type": ["outreach_type","event kind","activity_type"],
-    "event_date": ["outreach_date","eventdate","activity_date"],
-    "outcome": ["disposition","result","status"],
-    "referral_source": ["how heard","referrer","source","referred_by"],
-    "income_pct_fpl": ["fpl","% fpl","income fpl","income_pct_fpl"],
-    "age": ["client_age","age_years"],
-    "race_ethnicity": ["race","ethnicity","race/ethnicity"],
-    "gender": ["sex","gender_identity"],
-    "phone": ["phone_number","mobile","cell","contact_number"],
-    "email": ["email_address","e-mail"],
-    "address": ["street","addr","address1","address_line_1","address_line1"],
-    "latitude": ["lat","y"],
-    "longitude": ["lon","lng","long","x"],
+    "county": ["parish","borough","countyname","county_area"],
+    "state": ["province","state_code","st","region","regioncode"],
+    "language": ["primary_language","lang","primarylang"],
+    "event_type": ["outreach_type","event kind","activity","activity_type"],
+    "event_date": ["outreach_date","eventdate","activity_date","when","whenhappened"],
+    "outcome": ["disposition","result","status","outcometext"],
+    "referral_source": ["how heard","referrer","source","referred_by","heardvia","sourceinfo"],
+    "income_pct_fpl": ["fpl","% fpl","income fpl","fplpct","income_pct_fpl"],
+    "age": ["client_age","age_years","years"],
+    "race_ethnicity": ["race","ethnicity","race/ethnicity","ethnicgroup"],
+    "gender": ["sex","gender_identity","sexatbirth"],
+    "phone": ["phone_number","mobile","cell","contact","contactnum"],
+    "email": ["email_address","e-mail","mail","contactmail"],
+    "address": ["street","addr","address1","address line 1","address_line_1","addr1","addr_line1","addr_line_1","addr_line"],
+    "latitude": ["lat","y","ycoord"],
+    "longitude": ["lon","lng","long","x","xcoord"],
 }
 
 DEFAULT_ROLE_CLEANING = {
@@ -104,9 +104,6 @@ DEFAULT_ROLE_CLEANING = {
 ZIP_RE = re.compile(r"^(\d{5})(?:-\d{4})?$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-# -------------------------
-# Utilities
-# -------------------------
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(s).lower()).strip()
 
@@ -117,18 +114,14 @@ def _ratio(x: pd.Series, pred) -> float:
     except Exception:
         return 0.0
 
-# Heuristics
 def _is_date_series(s: pd.Series) -> float:
-    ser = pd.to_datetime(s, errors="coerce")
-    return ser.notna().mean()
+    return pd.to_datetime(s, errors="coerce").notna().mean()
 
 def _is_zip_series(s: pd.Series) -> float:
-    ser = s.astype(str).str.strip().str.extract(ZIP_RE)[0]
-    return ser.notna().mean()
+    return s.astype(str).str.strip().str.extract(ZIP_RE)[0].notna().mean()
 
 def _is_email_series(s: pd.Series) -> float:
-    ser = s.astype(str).str.strip().str.lower().str.match(EMAIL_RE)
-    return ser.fillna(False).mean()
+    return s.astype(str).str.strip().str.lower().str.match(EMAIL_RE).fillna(False).mean()
 
 def _is_phone_series(s: pd.Series) -> float:
     def ok(v):
@@ -148,28 +141,20 @@ def _is_categorical(s: pd.Series) -> float:
     n = len(s.dropna())
     if n == 0: return 0.0
     uniq = s.dropna().nunique()
-    return 1.0 - min(1.0, uniq / max(1, n))  # higher = more categorical
+    return 1.0 - min(1.0, uniq / max(1, n))
 
-# -------------------------
-# Loaders
-# -------------------------
 @st.cache_data(show_spinner=False)
 def load_df(file) -> pd.DataFrame:
     try:
         if file.name.lower().endswith(".csv"):
             return pd.read_csv(file)
-        else:
-            return pd.read_excel(file)
+        return pd.read_excel(file)
     except Exception:
-        # fallback: read uploaded bytes
+        # bytes fallback
         if file.name.lower().endswith(".csv"):
             return pd.read_csv(io.BytesIO(file.getvalue()))
-        else:
-            return pd.read_excel(io.BytesIO(file.getvalue()))
+        return pd.read_excel(io.BytesIO(file.getvalue()))
 
-# -------------------------
-# Header-based suggestions
-# -------------------------
 @st.cache_data(show_spinner=False)
 def suggest_mapping_by_header(columns: List[str]) -> Dict[str, Optional[str]]:
     suggestions = {}
@@ -197,9 +182,6 @@ def suggest_mapping_by_header(columns: List[str]) -> Dict[str, Optional[str]]:
                         suggestions[role] = c; break
     return suggestions
 
-# -------------------------
-# Content-driven mapping
-# -------------------------
 def choose_best_by_content(df: pd.DataFrame, roles_missing: List[str], used: set) -> Dict[str, Optional[str]]:
     res = {}
     cols = [c for c in df.columns if c not in used]
@@ -214,16 +196,15 @@ def choose_best_by_content(df: pd.DataFrame, roles_missing: List[str], used: set
     date_name_rank = {
         "opened_date": ["open","intake","start","created","filed"],
         "closed_date": ["close","resolved","end","completed"],
-        "event_date":  ["event","outreach","clinic","workshop","session"],
+        "event_date":  ["event","outreach","clinic","workshop","session","activity"],
     }
 
     for role in roles_missing:
         candidates = []
         if role in ("opened_date","closed_date","event_date"):
             for c in cols:
-                score = _is_date_series(df[c])
-                bonus = 0.1 if any(k in norm[c] for k in date_name_rank[role]) else 0.0
-                candidates.append((c, score + bonus))
+                score = _is_date_series(df[c]) + (0.1 if any(k in norm[c] for k in date_name_rank[role]) else 0.0)
+                candidates.append((c, score))
             pick = best(candidates)
         elif role == "zip":
             pick = best([(c, _is_zip_series(df[c]) + (0.1 if "zip" in norm[c] or "postal" in norm[c] else 0.0)) for c in cols])
@@ -236,7 +217,7 @@ def choose_best_by_content(df: pd.DataFrame, roles_missing: List[str], used: set
         elif role == "longitude":
             pick = best([(c, _is_lon_series(df[c]) + (0.1 if "lon" in norm[c] or "lng" in norm[c] or norm[c] == "x" else 0.0)) for c in cols])
         elif role == "department":
-            pick = best([(c, (0.1 if any(k in norm[c] for k in ["dept","unit","program","department"]) else 0.0) + 0.6*_is_categorical(df[c])) for c in cols])
+            pick = best([(c, (0.1 if any(k in norm[c] for k in ["dept","unit","program","department","team"]) else 0.0) + 0.6*_is_categorical(df[c])) for c in cols])
         elif role in ("legal_issue","event_type","outcome","referral_source","language","race_ethnicity","gender","city","county","state","address"):
             hints = {
                 "legal_issue": ["issue","case","matter","topic","problem","reason"],
@@ -248,7 +229,7 @@ def choose_best_by_content(df: pd.DataFrame, roles_missing: List[str], used: set
                 "gender": ["gender","sex"],
                 "city": ["city","municipality","town"],
                 "county": ["county","parish","borough"],
-                "state": ["state","province"],
+                "state": ["state","province","region"],
                 "address": ["address","street","addr"],
             }
             pick = best([(c, (0.2 if any(k in norm[c] for k in hints[role]) else 0.0) + 0.6*_is_categorical(df[c])) for c in cols])
@@ -258,8 +239,7 @@ def choose_best_by_content(df: pd.DataFrame, roles_missing: List[str], used: set
             pick = None
 
         if pick and pick not in used:
-            res[role] = pick
-            used.add(pick)
+            res[role] = pick; used.add(pick)
         else:
             res[role] = None
 
@@ -272,9 +252,7 @@ def auto_map_columns(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     by_content = choose_best_by_content(df, missing, used)
     return {r: by_header.get(r) or by_content.get(r) for r in STANDARD_ROLES}
 
-# -------------------------
-# Cleaning
-# -------------------------
+# Cleaning helpers
 def to_date(s): return pd.to_datetime(s, errors="coerce")
 def to_num(s, lo=None, hi=None):
     s = pd.to_numeric(s, errors="coerce")
@@ -332,70 +310,54 @@ def apply_mapping_and_clean(df: pd.DataFrame, role_map: Dict[str,Optional[str]],
 
     cleaned = src.copy()
     for role, series in unified.items():
-        cleaned[role] = series  # add/overwrite standardized role columns
+        cleaned[role] = series  # add standardized role columns
 
     subset = [c for c in ["client_id","department","opened_date","legal_issue","zip"] if c in cleaned.columns]
     if subset:
         before_len = len(cleaned)
         cleaned = cleaned.drop_duplicates(subset=subset, keep="first")
         removed = before_len - len(cleaned)
-        if removed:
-            issues.setdefault("duplicates_removed", []).append(str(removed))
+        if removed: issues.setdefault("duplicates_removed", []).append(str(removed))
 
     issues["unmapped_roles"] = [r for r in STANDARD_ROLES if not role_map.get(r)]
     return cleaned, issues
 
 # -------------------------
-# Side bar (uploads & filters)
+# Sidebar
 # -------------------------
 st.sidebar.title("⚖️ Legal Aid Analytics")
-st.sidebar.caption("Auto-map → Clean → (Optional) Join → Visualize → Report → Export")
+st.sidebar.caption("Upload → Auto-clean → (optional) Join → Analyze → Ask → Export")
 
-with st.sidebar.expander("Upload Internal Data", expanded=True):
-    up = st.file_uploader("CSV/Excel (cases/outreach)", type=["csv","xlsx"], accept_multiple_files=False)
+up = st.sidebar.file_uploader("Internal CSV/Excel", type=["csv","xlsx"], accept_multiple_files=False)
+up_ext = st.sidebar.file_uploader("External CSV/Excel (join on zip/county/state)", type=["csv","xlsx"], accept_multiple_files=False)
 
-with st.sidebar.expander("Upload External Data (optional)"):
-    up_ext = st.file_uploader("External CSV/Excel (e.g., Census by ZIP/County/State)", type=["csv","xlsx"], accept_multiple_files=False)
-
-st.title("Legal Aid Analytics — Automated Report")
-st.write("Upload a file — I’ll **detect columns**, **clean**, add **filters**, show **charts & maps**, and generate a **markdown report**.")
-
+st.title("Legal Aid Analytics — Automated Data Science Workflow")
 if not up:
-    st.info("👆 Upload your CSV/Excel to begin.")
+    st.info("👆 Upload a CSV or Excel file to begin.")
     st.stop()
 
-# Internal data flow
 raw_df = load_df(up)
 role_map = auto_map_columns(raw_df)
 clean_df, issues = apply_mapping_and_clean(raw_df, role_map)
 
-# External join (optional)
+# Optional external join
 work_df = clean_df.copy()
-ext_join_key: Optional[Tuple[str,str]] = None
 if up_ext:
-    try:
-        external_df = load_df(up_ext)
-    except Exception as e:
-        st.warning(f"Could not read external file: {e}")
-        external_df = pd.DataFrame()
-    if not external_df.empty:
-        st.subheader("External Data Join")
-        c1, c2 = st.columns(2)
-        with c1:
-            ext_key_col = st.selectbox("External join column", options=list(external_df.columns), index=0)
-        with c2:
-            int_key_role = st.selectbox("Internal key (role)", options=["zip","county","state"], index=0)
-        if ext_key_col and int_key_role in work_df.columns:
-            tmp_ext = external_df.rename(columns={ext_key_col: int_key_role})
-            work_df = work_df.merge(tmp_ext, on=int_key_role, how="left")
-            st.success(f"Joined external data on `{int_key_role}`.")
+    ext_df = load_df(up_ext)
+    st.subheader("External Data Join")
+    c1, c2 = st.columns(2)
+    with c1:
+        ext_key = st.selectbox("External join column", options=list(ext_df.columns), index=0)
+    with c2:
+        int_key = st.selectbox("Internal key (role)", options=[k for k in ["zip","county","state"] if k in work_df.columns], index=0 if "zip" in work_df.columns else 0)
+    if ext_key and int_key:
+        work_df = work_df.merge(ext_df.rename(columns={ext_key: int_key}), on=int_key, how="left")
+        st.success(f"Joined on `{int_key}`.")
 
 # -------------------------
-# Filters (only for present fields)
+# Filters (only if fields exist)
 # -------------------------
 st.subheader("Filters")
-
-# Date field preference
 available_dates = [c for c in ["opened_date","event_date","closed_date"] if c in work_df.columns and not work_df[c].isna().all()]
 date_field = st.selectbox("Date field", options=available_dates or ["(none)"])
 if date_field != "(none)":
@@ -406,7 +368,6 @@ if date_field != "(none)":
 else:
     start_date, end_date = None, None
 
-# Quick categorical filters
 cat_candidates = [c for c in ["department","legal_issue","event_type","outcome","language","state","county","city","zip"] if c in work_df.columns]
 filter_values = {}
 if cat_candidates:
@@ -417,12 +378,10 @@ if cat_candidates:
             sel = st.multiselect(c, options=opts, default=["(All)"])
             filter_values[c] = sel
 
-# Apply filters
 f_df = work_df.copy()
 if date_field != "(none)" and start_date and end_date:
     f_df = f_df[(pd.to_datetime(f_df[date_field]) >= pd.to_datetime(start_date)) &
                 (pd.to_datetime(f_df[date_field]) <= pd.to_datetime(end_date))]
-
 for col, choices in filter_values.items():
     if choices and "(All)" not in choices:
         f_df = f_df[f_df[col].astype(str).isin(set(map(str, choices)))]
@@ -436,11 +395,8 @@ with m1: st.metric("Rows (cleaned)", len(clean_df))
 with m2: st.metric("Rows in view", len(f_df))
 with m3: st.metric("Mapped roles", sum(1 for r in STANDARD_ROLES if role_map.get(r)))
 with m4: st.metric("Unmapped roles", len([r for r in STANDARD_ROLES if not role_map.get(r)]))
-
-with st.expander("See detected mapping"):
-    st.json({r: role_map.get(r) for r in STANDARD_ROLES if role_map.get(r)})
-with st.expander("Cleaning report"):
-    st.json(issues)
+with st.expander("Detected mapping"): st.json({r: role_map.get(r) for r in STANDARD_ROLES if role_map.get(r)})
+with st.expander("Cleaning report"): st.json(issues)
 
 # -------------------------
 # Overview & visuals
@@ -456,8 +412,6 @@ with k4:
 
 st.subheader("Trends & Breakdown")
 c1, c2 = st.columns(2)
-
-# Time series
 if date_field != "(none)" and date_field in f_df.columns and not f_df[date_field].isna().all():
     tmp = f_df[[date_field]].dropna().copy()
     if not tmp.empty:
@@ -466,7 +420,6 @@ if date_field != "(none)" and date_field in f_df.columns and not f_df[date_field
         with c1:
             st.plotly_chart(px.line(ts, x="month", y="count", title=f"Records per month ({date_field})"), use_container_width=True)
 
-# Top categories (prefer legal_issue/event_type)
 with c2:
     if "legal_issue" in f_df.columns and f_df["legal_issue"].notna().any():
         top_issues = f_df["legal_issue"].fillna("Unknown").value_counts().head(10).reset_index()
@@ -477,7 +430,6 @@ with c2:
         top_ev.columns = ["event_type","count"]
         st.plotly_chart(px.bar(top_ev, x="event_type", y="count", title="Top Outreach Event Types"), use_container_width=True)
 
-# Outcomes by department
 if {"outcome","department"}.issubset(f_df.columns):
     st.plotly_chart(
         px.bar(
@@ -487,7 +439,6 @@ if {"outcome","department"}.issubset(f_df.columns):
         use_container_width=True
     )
 
-# Demographics
 st.subheader("Demographics")
 d1, d2, d3, d4 = st.columns(4)
 if "language" in f_df.columns and f_df["language"].notna().any():
@@ -509,7 +460,6 @@ if "age" in f_df.columns and f_df["age"].notna().any():
     with d4:
         st.plotly_chart(px.histogram(f_df, x="age", nbins=20, title="Age distribution"), use_container_width=True)
 
-# Income (% FPL)
 if "income_pct_fpl" in f_df.columns and f_df["income_pct_fpl"].notna().any():
     bins = pd.cut(f_df["income_pct_fpl"], bins=[0,100,150,200,300,600], include_lowest=True)
     fpl = bins.value_counts().sort_index().reset_index()
@@ -530,7 +480,7 @@ with tabs[0]:
                 popup = folium.Popup(
                     f"Dept: {r.get('department','')}<br>"
                     f"Issue: {r.get('legal_issue','')}<br>"
-                    f"Date: {r.get(date_field,'') if date_field!='(none)' else ''}",
+                    f"Date: {r.get(date_field,'') if date_field and date_field!='(none)' else ''}",
                     max_width=280
                 )
                 folium.CircleMarker([r["latitude"], r["longitude"]], radius=4, popup=popup).add_to(m)
@@ -545,66 +495,120 @@ with tabs[1]:
         st.info("No ZIP column found.")
 
 # -------------------------
-# Auto-generated report (markdown)
+# Ask a question (NL or SQL)
 # -------------------------
-st.subheader("Analysis Report")
+st.subheader("Ask a question about the data")
+st.caption("Examples (natural language): 'count by department', 'top 5 legal_issue', 'average age by department', 'rows where state=NY'. "
+           "Set **SQL mode** to run a DuckDB SQL query like: `select state, count(*) from df group by 1 order by 2 desc limit 10`.")
+
+q1, q2 = st.columns([3,1])
+question = q1.text_input("Your question", value="")
+sql_mode = q2.toggle("SQL mode (DuckDB)", value=False, help="Run raw SQL against the filtered dataframe")
+run_q = st.button("Run")
+
+def answer_nl(q: str, df: pd.DataFrame):
+    q = q.strip().lower()
+    if not q: return None, "Type a question."
+    # top N of column
+    m = re.match(r"top\s+(\d+)\s+([a-z0-9_]+)", q)
+    if m:
+        n = int(m.group(1)); col = m.group(2)
+        if col in df.columns:
+            out = df[col].value_counts().head(n).reset_index()
+            out.columns = [col, "count"]
+            return out, f"Top {n} of {col}"
+    # count by column
+    m = re.match(r"(count|how many)\s+(by|per)\s+([a-z0-9_]+)", q)
+    if m:
+        col = m.group(3)
+        if col in df.columns:
+            out = df.groupby(col).size().reset_index(name="count").sort_values("count", ascending=False)
+            return out, f"Count by {col}"
+    # average/mean/median of X by Y
+    m = re.match(r"(average|mean|median)\s+([a-z0-9_]+)\s+(by|per)\s+([a-z0-9_]+)", q)
+    if m:
+        agg = m.group(1); x = m.group(2); y = m.group(4)
+        if x in df.columns and y in df.columns:
+            func = "mean" if agg in ("average","mean") else "median"
+            out = df.groupby(y)[x].agg(func).reset_index().sort_values(x, ascending=False)
+            return out, f"{agg.title()} {x} by {y}"
+    # sum of X by Y
+    m = re.match(r"(sum|total)\s+([a-z0-9_]+)\s+(by|per)\s+([a-z0-9_]+)", q)
+    if m:
+        x = m.group(2); y = m.group(4)
+        if x in df.columns and y in df.columns:
+            out = df.groupby(y)[x].sum(min_count=1).reset_index().sort_values(x, ascending=False)
+            return out, f"Sum {x} by {y}"
+    # rows where col=value (supports = and ==)
+    m = re.match(r"(rows|show)\s+where\s+([a-z0-9_]+)\s*={1,2}\s*([a-z0-9_\-@.]+)", q)
+    if m:
+        col = m.group(2); val = m.group(3)
+        if col in df.columns:
+            out = df[df[col].astype(str).str.lower() == val.lower()]
+            return out.head(100), f"Rows where {col} == {val} (showing up to 100)"
+    # how many rows
+    if q in ("how many rows","row count","count rows"):
+        return pd.DataFrame({"rows":[len(df)]}), "Row count"
+    return None, "Sorry — try a pattern like: 'count by department', 'top 10 zip', 'average age by department', or switch to SQL mode."
+
+if run_q:
+    if sql_mode:
+        if not HAS_DUCKDB:
+            st.error("DuckDB not available. Add `duckdb` to requirements.txt or turn off SQL mode.")
+        else:
+            try:
+                # register dataframe as a DuckDB view
+                duckdb.sql("DROP VIEW IF EXISTS df")
+                duckdb.register("df", f_df)
+                res = duckdb.sql(question).df()
+                st.dataframe(res, use_container_width=True)
+            except Exception as e:
+                st.error(f"SQL error: {e}")
+    else:
+        res, msg = answer_nl(question, f_df)
+        st.caption(msg)
+        if isinstance(res, pd.DataFrame):
+            st.dataframe(res, use_container_width=True)
+
+# -------------------------
+# Auto-generated summary report
+# -------------------------
+st.subheader("Analysis Report (Markdown)")
 def build_report(df: pd.DataFrame) -> str:
     lines = []
     lines.append(f"# Legal Aid Analytics — Automated Report")
-    lines.append("")
-    lines.append(f"**Rows:** {len(df)}")
+    lines.append(f"**Rows in view:** {len(df)}")
     if "client_id" in df.columns: lines.append(f"**Unique clients:** {df['client_id'].nunique()}")
     if "department" in df.columns: lines.append(f"**Departments:** {df['department'].nunique()}")
     if "zip" in df.columns: lines.append(f"**ZIPs covered:** {df['zip'].nunique()}")
-    # date span
     for dcol in ["opened_date","event_date","closed_date"]:
         if dcol in df.columns and not df[dcol].isna().all():
             rng = f"{pd.to_datetime(df[dcol]).min().date()} → {pd.to_datetime(df[dcol]).max().date()}"
             lines.append(f"**{dcol} span:** {rng}")
-    lines.append("")
-    # top legal issues / events
     if "legal_issue" in df.columns and df["legal_issue"].notna().any():
         top = df["legal_issue"].value_counts().head(5)
-        lines.append("**Top legal issues:**")
-        for k, v in top.items():
-            lines.append(f"- {k}: {v}")
-        lines.append("")
+        lines.append("**Top legal issues:**"); lines += [f"- {k}: {v}" for k, v in top.items()]
     elif "event_type" in df.columns and df["event_type"].notna().any():
         top = df["event_type"].value_counts().head(5)
-        lines.append("**Top outreach event types:**")
-        for k, v in top.items():
-            lines.append(f"- {k}: {v}")
-        lines.append("")
-    # outcomes
+        lines.append("**Top outreach event types:**"); lines += [f"- {k}: {v}" for k, v in top.items()]
     if {"department","outcome"}.issubset(df.columns):
-        lines.append("**Outcomes by department (top):**")
         ob = df.groupby(["department","outcome"]).size().reset_index(name="count").sort_values("count", ascending=False).head(10)
-        for _, r in ob.iterrows():
-            lines.append(f"- {r['department']}: {r['outcome']} — {r['count']}")
-        lines.append("")
-    # demographics
+        lines.append("**Outcomes by department (top):**")
+        for _, r in ob.iterrows(): lines.append(f"- {r['department']}: {r['outcome']} — {r['count']}")
     for col, label in [("language","Languages"), ("race_ethnicity","Race/Ethnicity"), ("gender","Gender")]:
         if col in df.columns and df[col].notna().any():
             top = df[col].value_counts().head(5)
-            lines.append(f"**{label} (top):**")
-            for k, v in top.items():
-                lines.append(f"- {k}: {v}")
-            lines.append("")
-    # income / age
+            lines.append(f"**{label} (top):**"); lines += [f"- {k}: {v}" for k, v in top.items()]
     if "income_pct_fpl" in df.columns and df["income_pct_fpl"].notna().any():
-        lines.append("**Income (FPL bands):**")
         bands = pd.cut(df["income_pct_fpl"], bins=[0,100,150,200,300,600], include_lowest=True).value_counts().sort_index()
-        for k, v in bands.items():
-            lines.append(f"- {k}: {v}")
-        lines.append("")
+        lines.append("**Income (FPL bands):**"); lines += [f"- {k}: {v}" for k, v in bands.items()]
     if "age" in df.columns and df["age"].notna().any():
         lines.append(f"**Age:** mean={df['age'].mean():.1f}, median={df['age'].median():.1f}")
-        lines.append("")
     return "\n".join(lines)
 
 report_md = build_report(f_df)
 st.markdown(report_md)
-st.download_button("⬇️ Download report (Markdown)", report_md.encode(), file_name="legal_aid_report.md", mime="text/markdown")
+st.download_button("⬇️ Download report (.md)", report_md.encode(), file_name="legal_aid_report.md", mime="text/markdown")
 
 # -------------------------
 # Export filtered data
@@ -615,11 +619,10 @@ with io.StringIO() as buffer:
     csv_bytes = buffer.getvalue().encode()
 st.download_button("Download filtered CSV", data=csv_bytes, file_name="legal_aid_filtered.csv", mime="text/csv")
 
-# Footer help
-with st.expander("ℹ️ Notes & Tips"):
+with st.expander("ℹ️ Notes"):
     st.markdown("""
 - Columns are **auto-detected** from headers and the **data itself** (dates, ZIPs, lat/long, emails, phones).
-- Maps show if `latitude` & `longitude` exist. Without them, you’ll still get a **ZIP hotspot table**.
-- Use the optional **External Data Join** to enrich by `zip`, `county`, or `state`.
-- Want boundary choropleths (ZIP/tract polygons) or a multi-page app per department? I can add GeoJSON support next.
+- Ask questions in **plain language** (e.g., *count by department*, *top 10 zip*, *average age by department*), or switch to **SQL mode** to run DuckDB queries.
+- For maps you need `latitude` & `longitude`. If you only have ZIP, you’ll still get a ZIP hotspot table.
+- Join an external file on `zip`, `county`, or `state` to enrich your analysis.
 """)
