@@ -6,5 +6,5 @@ folium==0.20.0
 openpyxl==3.1.5
 rapidfuzz==3.13.0
 duckdb==1.0.0
-
+pgeocode==0.5.0
 
