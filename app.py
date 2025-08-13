@@ -186,7 +186,7 @@ def clean_df(df: pd.DataFrame, prof: pd.DataFrame):
         if "phone" in tags:
             def fmt(x):
                 if pd.isna(x): return np.nan
-                d = PHONE_DIGITS.sub("", str(x))
+                d = re.sub(r"\D+", "", str(x))
                 if len(d)==10: return f"({d[:3]}) {d[3:6]}-{d[6:]}"
                 if len(d)==11 and d.startswith("1"):
                     d = d[1:]; return f"+1 ({d[:3]}) {d[3:6]}-{d[6:]}"
@@ -218,7 +218,11 @@ def clean_df(df: pd.DataFrame, prof: pd.DataFrame):
     if len(out) != before_rows:
         actions.append(("*all*", "drop_duplicates", f"{before_rows - len(out)} removed"))
 
-    act_df = pd.DataFrame(actions, columns=["column","action","details"]) or pd.DataFrame([{"column":"(none)","action":"no-op","details":"no rules"}])
+    # ✅ FIX: don’t use DataFrame with `or` (truth value is ambiguous)
+    act_df = pd.DataFrame(actions, columns=["column","action","details"])
+    if act_df.empty:
+        act_df = pd.DataFrame([{"column":"(none)","action":"no-op","details":"no rules"}])
+
     return out, act_df
 
 # ---------- choices for dashboard ----------
