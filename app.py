@@ -1,5 +1,5 @@
 # app.py
-# Content-Driven Legal Aid Analytics — precise cleaning + EDA for unknown schemas
+# Legal Aid Analytics — Content-driven cleaning + EDA + Maps + Join + Q&A (Lite Mode for big files)
 # Runtime: python-3.11
 
 import io, re, math, unicodedata
@@ -13,16 +13,17 @@ import streamlit as st
 import folium
 from streamlit.components.v1 import html as st_html
 from pandas.api.types import is_numeric_dtype, is_categorical_dtype
+from folium.plugins import MarkerCluster, HeatMap
 
-# Optional helpers (ZIP → lat/lon, ad-hoc SQL, markdown table pretty print)
+# Optional helpers (ZIP → lat/lon, SQL, markdown pretty tables)
 try:
-    import pgeocode       # offline ZIP centroid lookup
+    import pgeocode  # offline ZIP centroid lookup
     HAS_PGEO = True
 except Exception:
     HAS_PGEO = False
 
 try:
-    import duckdb         # optional SQL mode
+    import duckdb  # optional SQL
     HAS_DUCKDB = True
 except Exception:
     HAS_DUCKDB = False
@@ -33,22 +34,48 @@ try:
 except Exception:
     HAS_TABULATE = False
 
-st.set_page_config(page_title="Legal Aid Analytics — Content-Driven", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="Legal Aid Analytics (Content-Driven)", page_icon="⚖️", layout="wide")
 
-# --------- Patterns & helpers ----------
-ZIP_RE      = re.compile(r"^(\d{5})(?:-\d{4})?$")
-EMAIL_RE    = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-PHONE_DIGITS= re.compile(r"\D+")
-PCT_RE      = re.compile(r"^\s*-?\s*\d+(\.\d+)?\s*%$")
-CURRENCY_RE = re.compile(r"^\s*\(?\s*\$?\s*-?\s*\d{1,3}(,\d{3})*(\.\d+)?\s*\)?\s*$")
+# ---------- Lite Mode (prevents huge WebSocket payloads) ----------
+LITE_MODE = st.sidebar.toggle(
+    "🛡️ Safe mode (big files)",
+    value=True,
+    help="Limits rows/cols sent to the browser and uses clustered/heat maps for many points."
+)
 
-NA_STRINGS = {"", "na", "n/a", "none", "null", "nil", "nan", "—", "-", "unknown"}
+MAX_ROWS    = 300  if LITE_MODE else 1000   # cap rows shown in tables (analysis/export still use full data)
+MAX_COLS    = 25   if LITE_MODE else 50
+MAX_MARKERS = 400  if LITE_MODE else 1000
+HEATMAP_AT  = 300  if LITE_MODE else 800
+
+def _cap_df(df, max_rows=MAX_ROWS, max_cols=MAX_COLS):
+    if df is None:
+        return df
+    d = df
+    if d.shape[1] > max_cols:
+        d = d.iloc[:, :max_cols]
+    if d.shape[0] > max_rows:
+        d = d.head(max_rows)
+    return d
+
+def show_df(df, label=None):
+    capped = _cap_df(df)
+    if label:
+        st.caption(f"{label} (showing {len(capped)}/{len(df)} rows, {capped.shape[1]}/{df.shape[1]} cols)")
+    st.dataframe(capped, use_container_width=True)
+
+# ---------- Patterns & helpers ----------
+ZIP_RE       = re.compile(r"^(\d{5})(?:-\d{4})?$")
+EMAIL_RE     = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PHONE_DIGITS = re.compile(r"\D+")
+PCT_RE       = re.compile(r"^\s*-?\s*\d+(\.\d+)?\s*%$")
+NA_STRINGS   = {"", "na", "n/a", "none", "null", "nil", "nan", "—", "-", "unknown"}
 
 def norm_str(x):
     if pd.isna(x): return np.nan
     s = str(x)
     s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\u200b","").strip()  # drop zero-width space
+    s = s.replace("\u200b","").strip()
     return s
 
 def is_phone_like(x: str) -> bool:
@@ -58,11 +85,9 @@ def is_phone_like(x: str) -> bool:
 def parse_numeric_like(s: pd.Series) -> pd.Series:
     """Parse numbers including currency ($, commas, parentheses) and percents."""
     x = s.astype(str).str.strip()
-    # percents to float range 0..100 (keep as numeric percent)
-    is_pct = x.str.match(PCT_RE, na=False)
-    # remove % and spaces
+    # percents
     pct_vals = pd.to_numeric(x.str.replace("%","",regex=False), errors="coerce")
-    # currency: remove $, commas, handle (123) as -123
+    # currency: remove $, commas and (123) → -123
     cur = x.str.replace("$","",regex=False).str.replace(",","",regex=False)
     cur = cur.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
     cur_vals = pd.to_numeric(cur, errors="coerce")
@@ -74,7 +99,7 @@ def parse_numeric_like(s: pd.Series) -> pd.Series:
     out[out.isna()] = pct_vals[out.isna()]
     return out
 
-# --------- Load data ----------
+# ---------- Load data ----------
 @st.cache_data(show_spinner=False)
 def load_df(file) -> pd.DataFrame:
     try:
@@ -82,16 +107,15 @@ def load_df(file) -> pd.DataFrame:
             return pd.read_csv(file)
         return pd.read_excel(file)
     except Exception:
-        # bytes fallback
+        # bytes fallback (Streamlit sometimes needs this)
         if file.name.lower().endswith(".csv"):
             return pd.read_csv(io.BytesIO(file.getvalue()))
         return pd.read_excel(io.BytesIO(file.getvalue()))
 
-# --------- Profile columns (content-driven) ----------
+# ---------- Profile columns (content-driven) ----------
 def profile_column(s: pd.Series) -> Dict[str, object]:
     raw = s.copy()
     total = len(raw)
-    # normalize strings for detection (won't write back here)
     s_norm = raw.astype(str).map(norm_str)
 
     non_null = raw.notna().sum()
@@ -116,13 +140,13 @@ def profile_column(s: pd.Series) -> Dict[str, object]:
     cat_score = 1.0 - min(1.0, (uniq / max(1, non_null))) if non_null else 0.0
 
     tags = []
-    if date_rate >= 0.6: tags.append("date")
-    if numeric_rate >= 0.9: tags.append("numeric")
-    if zip_rate >= 0.6: tags.append("zip")
-    if email_rate >= 0.6: tags.append("email")
-    if phone_rate >= 0.6: tags.append("phone")
-    if lat_rate >= 0.9: tags.append("latitude")
-    if lon_rate >= 0.9: tags.append("longitude")
+    if date_rate   >= 0.6: tags.append("date")
+    if numeric_rate>= 0.9: tags.append("numeric")
+    if zip_rate    >= 0.6: tags.append("zip")
+    if email_rate  >= 0.6: tags.append("email")
+    if phone_rate  >= 0.6: tags.append("phone")
+    if lat_rate    >= 0.9: tags.append("latitude")
+    if lon_rate    >= 0.9: tags.append("longitude")
     if "numeric" not in tags and "date" not in tags and cat_score >= 0.6 and uniq <= 60:
         tags.append("category")
     if not tags and dtype == "object" and uniq > 60:
@@ -145,7 +169,7 @@ def profile_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     prof = pd.DataFrame(rows).sort_values(["tags","column"])
     return prof
 
-# --------- Cleaning with per-column action log ----------
+# ---------- Cleaning with per-column action log ----------
 def clean_df(df: pd.DataFrame, prof: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
     out = df.copy()
     actions = []
@@ -160,8 +184,8 @@ def clean_df(df: pd.DataFrame, prof: pd.DataFrame) -> (pd.DataFrame, pd.DataFram
             col = col.mask(col.str.lower().isin(NA_STRINGS))
             actions.append((c, "normalize_text", "trim, NFKC, drop NA-like strings"))
 
-        # parse dates if tagged
-        if any(t in (prof.loc[prof["column"]==c, "tags"].values[0] or "") for t in ["date"]):
+        # parse dates
+        if "date" in (prof.loc[prof["column"]==c, "tags"].values[0] or ""):
             col = pd.to_datetime(col, errors="coerce")
             actions.append((c, "parse_date", "to_datetime"))
 
@@ -211,13 +235,12 @@ def clean_df(df: pd.DataFrame, prof: pd.DataFrame) -> (pd.DataFrame, pd.DataFram
     if len(out) != before_rows:
         actions.append(("*all*", "drop_duplicates", f"{before_rows - len(out)} removed"))
 
-    # cleaning summary dataframe
     act_df = pd.DataFrame(actions, columns=["column","action","details"])
     if act_df.empty:
         act_df = pd.DataFrame([{"column":"(none)","action":"no-op","details":"no cleaning rules applied"}])
     return out, act_df
 
-# --------- Autopilot choices ----------
+# ---------- Autopilot choices ----------
 def choose_best(prof: pd.DataFrame, df: pd.DataFrame):
     date = None
     cand = prof[prof["tags"].str.contains("date", na=False)]
@@ -237,7 +260,7 @@ def choose_best(prof: pd.DataFrame, df: pd.DataFrame):
 
     return dict(date=date, cat=best_cat, num=best_num, cat_list=cats, num_list=nums, lat=lat, lon=lon, zip=zipc)
 
-# --------- ZIP → coordinates ----------
+# ---------- ZIP → coordinates ----------
 @st.cache_data(show_spinner=False)
 def zip_to_latlon(zip_list: List[str]) -> pd.DataFrame:
     if not HAS_PGEO or not zip_list:
@@ -247,7 +270,7 @@ def zip_to_latlon(zip_list: List[str]) -> pd.DataFrame:
     res = res.rename(columns={"postal_code":"zip","latitude":"lat","longitude":"lon"})
     return res[["zip","lat","lon"]]
 
-# --------- UI ----------
+# ---------- UI ----------
 st.sidebar.title("⚖️ Legal Aid Analytics — Content-Driven")
 st.sidebar.caption("Upload → Clean (by content) → (optional) Join → Filter → Visualize → Ask → Export")
 
@@ -263,18 +286,17 @@ if not up:
 raw = load_df(up)
 
 st.subheader("1) Columns detected in your file")
-st.caption("These are the **actual headers** with friendly info. No jargon.")
+st.caption("These are the **actual headers** with friendly info.")
 prof = profile_dataframe(raw)
-st.dataframe(prof[["column","dtype","missing_%","unique_vals","tags","example"]], use_container_width=True, hide_index=True)
+show_df(prof[["column","dtype","missing_%","unique_vals","tags","example"]], "Column profile")
 
 st.subheader("2) Cleaning (content-aware)")
 clean, clean_log = clean_df(raw, prof)
 st.success("Done: normalized text & NA values, parsed dates, validated email/phone/ZIP, coerced numeric (currency/percent), bounded lat/lon, removed duplicates.")
 with st.expander("Cleaning Summary (what I did)"):
-    st.dataframe(clean_log, use_container_width=True)
-
+    show_df(clean_log, "Cleaning actions")
 with st.expander("Preview cleaned data"):
-    st.dataframe(clean.head(50), use_container_width=True)
+    show_df(clean.head(200), "Preview")
 
 # Optional external join
 work = clean.copy()
@@ -287,7 +309,7 @@ if up_ext:
         work = work.merge(ext.rename(columns={right_key:left_key}), on=left_key, how="left")
         st.success(f"Joined on “{left_key}”.")
         with st.expander("Preview joined data"):
-            st.dataframe(work.head(50), use_container_width=True)
+            show_df(work.head(200), "Preview")
 
 # Autopilot picks defaults
 choice = choose_best(prof, work)
@@ -334,7 +356,7 @@ if st.button("Reset all filters"):
     st.session_state.clear()
     st.experimental_rerun()
 
-# If filters wiped everything, fallback to full dataset (so nontechnical users aren’t stuck)
+# If filters wiped everything, fallback to full dataset (so the dashboard isn’t empty)
 if len(filtered) == 0:
     st.warning("All rows were filtered out. Showing the full dataset so charts aren’t empty.")
     filtered = work.copy()
@@ -347,7 +369,7 @@ with k2: st.metric("Rows in view", len(filtered))
 with k3: st.metric("Columns", filtered.shape[1])
 
 with st.expander("See the data we’re charting"):
-    st.dataframe(filtered.head(50), use_container_width=True)
+    show_df(filtered.head(200), "Preview")
 
 # Time series
 if choice["date"] and filtered[choice["date"]].notna().any():
@@ -372,26 +394,43 @@ if len(num_cols_all) >= 2:
     corr = filtered[num_cols_all].corr(numeric_only=True)
     st.plotly_chart(px.imshow(corr, text_auto=True, title="Numbers that move together"), use_container_width=True)
 
-# Map (lat/lon or ZIP centroid fallback)
+# Map — lat/lon or ZIP centroid fallback (with caps/heatmap for big datasets)
 st.subheader("Map")
 lat_c, lon_c, zip_c = choice["lat"], choice["lon"], choice["zip"]
-if lat_c and lon_c and filtered[[lat_c, lon_c]].notna().any().any():
-    pts = filtered.dropna(subset=[lat_c, lon_c])
-    if not pts.empty:
-        m = folium.Map(location=[pts[lat_c].mean(), pts[lon_c].mean()], zoom_start=9)
-        for _, r in pts.iterrows():
-            folium.CircleMarker([r[lat_c], r[lon_c]], radius=4).add_to(m)
-        st_html(m._repr_html_(), height=520)
-    else:
+
+def render_point_map(points_df, lat_col, lon_col):
+    pts = points_df.dropna(subset=[lat_col, lon_col])
+    if pts.empty:
         st.info("No rows with both latitude and longitude after filters.")
-elif zip_c and filtered[zip_c].notna().any() and HAS_PGEO:
+        return
+    n = len(pts)
+    # Limit rows sent to browser
+    if n > MAX_MARKERS and n < HEATMAP_AT:
+        pts = pts.head(MAX_MARKERS)
+        n = len(pts)
+    # Build map
+    m = folium.Map(location=[pts[lat_col].mean(), pts[lon_col].mean()], zoom_start=8, prefer_canvas=True)
+    if n >= HEATMAP_AT:
+        HeatMap(pts[[lat_col, lon_col]].values.tolist(), radius=8, blur=12).add_to(m)
+        st.caption(f"Heatmap shown for {n:,} points")
+    else:
+        cluster = MarkerCluster().add_to(m)
+        for _, r in pts.iterrows():
+            folium.CircleMarker([r[lat_col], r[lon_col]], radius=4).add_to(cluster)
+        st.caption(f"Clustered markers shown for {n:,} points")
+    st_html(m._repr_html_(), height=520)
+
+if lat_c and lon_c and filtered.get(lat_c) is not None and filtered.get(lon_c) is not None \
+   and filtered[[lat_c, lon_c]].notna().any().any():
+    render_point_map(filtered, lat_c, lon_c)
+elif zip_c and filtered.get(zip_c) is not None and filtered[zip_c].notna().any() and HAS_PGEO:
     z = filtered[zip_c].astype(str).str.extract(r"(\d{5})")[0].dropna()
     if not z.empty:
         counts = z.value_counts().rename_axis("zip").reset_index(name="count")
         geo = zip_to_latlon(counts["zip"].tolist())
         zz = counts.merge(geo, how="left", on="zip").dropna(subset=["lat","lon"])
         if not zz.empty:
-            m = folium.Map(location=[zz["lat"].mean(), zz["lon"].mean()], zoom_start=7)
+            m = folium.Map(location=[zz["lat"].mean(), zz["lon"].mean()], zoom_start=7, prefer_canvas=True)
             for _, r in zz.iterrows():
                 folium.Circle(location=[r["lat"], r["lon"]],
                               radius=200 + 50*float(r["count"]),
@@ -461,7 +500,7 @@ if go:
     res, msg = answer_nl(query, filtered)
     st.caption(msg)
     if isinstance(res, pd.DataFrame):
-        st.dataframe(res, use_container_width=True)
+        show_df(res, "Answer")
 
 # Report & Export
 st.subheader("7) Download report & data")
@@ -486,9 +525,10 @@ def build_report(df: pd.DataFrame, choice) -> str:
     nums = [c for c in df.columns if is_numeric_dtype(df[c])]
     if nums:
         desc = df[nums].describe().T.round(2)
-        if HAS_TABULATE:
+        try:
+            import tabulate  # pretty markdown if available
             lines.append("\n" + desc.to_markdown())
-        else:
+        except Exception:
             lines.append("\n```\n" + desc.to_string() + "\n```")
     return "\n".join(lines)
 
