@@ -1,0 +1,17 @@
+# data (keep PII out of the repo)
+*.csv
+*.xlsx
+data/
+
+# notebooks
+.ipynb_checkpoints/
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+
+# envs & secrets
+.env
+.venv/
+.secrets/
+.streamlit/secrets.toml
