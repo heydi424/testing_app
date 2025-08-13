@@ -1,10 +1,9 @@
 # app.py
-# Legal Aid Analytics — Content-driven cleaning + EDA + Maps + Join + Q&A (Lite Mode for big files)
+# Legal Aid Analytics — Content-driven cleaning + EDA + Maps + Join + Q&A (Ultra-Lite for big files)
 # Runtime: python-3.11
 
 import io, re, math, unicodedata
-from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -23,7 +22,7 @@ except Exception:
     HAS_PGEO = False
 
 try:
-    import duckdb  # optional SQL
+    import duckdb  # optional SQL mode (not used heavily here)
     HAS_DUCKDB = True
 except Exception:
     HAS_DUCKDB = False
@@ -34,20 +33,23 @@ try:
 except Exception:
     HAS_TABULATE = False
 
-st.set_page_config(page_title="Legal Aid Analytics (Content-Driven)", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="Legal Aid Analytics (Ultra-Lite)", page_icon="⚖️", layout="wide")
 
-# ---------- Lite Mode (prevents huge WebSocket payloads) ----------
+# ---------- Ultra-Lite (prevents huge WebSocket payloads) ----------
 LITE_MODE = st.sidebar.toggle(
     "🛡️ Safe mode (big files)",
     value=True,
     help="Limits rows/cols sent to the browser and uses clustered/heat maps for many points."
 )
 
-MAX_ROWS    = 300  if LITE_MODE else 1000   # cap rows shown in tables (analysis/export still use full data)
-MAX_COLS    = 25   if LITE_MODE else 50
-MAX_MARKERS = 400  if LITE_MODE else 1000
-HEATMAP_AT  = 300  if LITE_MODE else 800
+MAX_ROWS    = 100  if LITE_MODE else 500   # rows shown in tables (analysis/export use full data)
+MAX_COLS    = 15   if LITE_MODE else 30
+MAX_MARKERS = 200  if LITE_MODE else 800
+HEATMAP_AT  = 300  if LITE_MODE else 1000
+HEATMAP_CAP = 4000 if LITE_MODE else 10000  # cap points in heatmap
+MAX_NUMERIC_FOR_CORR = 8                    # cap numeric columns for correlation viz
 
+# ---- display caps ----
 def _cap_df(df, max_rows=MAX_ROWS, max_cols=MAX_COLS):
     if df is None:
         return df
@@ -64,18 +66,16 @@ def show_df(df, label=None):
         st.caption(f"{label} (showing {len(capped)}/{len(df)} rows, {capped.shape[1]}/{df.shape[1]} cols)")
     st.dataframe(capped, use_container_width=True)
 
-# ---------- Patterns & helpers ----------
+# ---------- patterns & helpers ----------
 ZIP_RE       = re.compile(r"^(\d{5})(?:-\d{4})?$")
 EMAIL_RE     = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PHONE_DIGITS = re.compile(r"\D+")
-PCT_RE       = re.compile(r"^\s*-?\s*\d+(\.\d+)?\s*%$")
 NA_STRINGS   = {"", "na", "n/a", "none", "null", "nil", "nan", "—", "-", "unknown"}
 
 def norm_str(x):
     if pd.isna(x): return np.nan
     s = str(x)
-    s = unicodedata.normalize("NFKC", s)
-    s = s.replace("\u200b","").strip()
+    s = unicodedata.normalize("NFKC", s).strip()
     return s
 
 def is_phone_like(x: str) -> bool:
@@ -85,21 +85,18 @@ def is_phone_like(x: str) -> bool:
 def parse_numeric_like(s: pd.Series) -> pd.Series:
     """Parse numbers including currency ($, commas, parentheses) and percents."""
     x = s.astype(str).str.strip()
-    # percents
-    pct_vals = pd.to_numeric(x.str.replace("%","",regex=False), errors="coerce")
-    # currency: remove $, commas and (123) → -123
-    cur = x.str.replace("$","",regex=False).str.replace(",","",regex=False)
-    cur = cur.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+    pct_vals = pd.to_numeric(x.str.replace("%", "", regex=False), errors="coerce")
+    cur = x.str.replace("$", "", regex=False).str.replace(",", "", regex=False)
+    # Convert (123) → -123
+    cur = cur.str.replace(r"^\((.*)\)$", lambda m: f"-{m.group(1)}", regex=True)
     cur_vals = pd.to_numeric(cur, errors="coerce")
-    # plain numeric
     plain_vals = pd.to_numeric(x, errors="coerce")
-    # choose best per-row
     out = plain_vals.copy()
     out[plain_vals.isna()] = cur_vals[plain_vals.isna()]
     out[out.isna()] = pct_vals[out.isna()]
     return out
 
-# ---------- Load data ----------
+# ---------- load data ----------
 @st.cache_data(show_spinner=False)
 def load_df(file) -> pd.DataFrame:
     try:
@@ -107,12 +104,11 @@ def load_df(file) -> pd.DataFrame:
             return pd.read_csv(file)
         return pd.read_excel(file)
     except Exception:
-        # bytes fallback (Streamlit sometimes needs this)
         if file.name.lower().endswith(".csv"):
             return pd.read_csv(io.BytesIO(file.getvalue()))
         return pd.read_excel(io.BytesIO(file.getvalue()))
 
-# ---------- Profile columns (content-driven) ----------
+# ---------- profile columns (content-driven) ----------
 def profile_column(s: pd.Series) -> Dict[str, object]:
     raw = s.copy()
     total = len(raw)
@@ -123,7 +119,6 @@ def profile_column(s: pd.Series) -> Dict[str, object]:
     dtype = str(raw.dtype)
     example = raw.dropna().iloc[0] if non_null else None
 
-    # detection rates
     date_rate   = pd.to_datetime(s_norm, errors="coerce").notna().mean()
     email_rate  = s_norm.str.lower().str.match(EMAIL_RE).fillna(False).mean()
     zip_rate    = s_norm.str.extract(ZIP_RE)[0].notna().mean()
@@ -131,11 +126,9 @@ def profile_column(s: pd.Series) -> Dict[str, object]:
     lat_rate    = pd.to_numeric(raw, errors="coerce").between(-90, 90).mean()
     lon_rate    = pd.to_numeric(raw, errors="coerce").between(-180, 180).mean()
 
-    # numeric-like (currency/percent/plain)
     num_parsed  = parse_numeric_like(s_norm)
     numeric_rate= num_parsed.notna().mean()
 
-    # cardinality
     uniq = raw.dropna().nunique()
     cat_score = 1.0 - min(1.0, (uniq / max(1, non_null))) if non_null else 0.0
 
@@ -166,11 +159,10 @@ def profile_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for c in df.columns:
         rows.append({"column": c, **profile_column(df[c])})
-    prof = pd.DataFrame(rows).sort_values(["tags","column"])
-    return prof
+    return pd.DataFrame(rows).sort_values(["tags", "column"])
 
-# ---------- Cleaning with per-column action log ----------
-def clean_df(df: pd.DataFrame, prof: pd.DataFrame) -> (pd.DataFrame, pd.DataFrame):
+# ---------- cleaning with action log ----------
+def clean_df(df: pd.DataFrame, prof: pd.DataFrame):
     out = df.copy()
     actions = []
 
@@ -178,24 +170,20 @@ def clean_df(df: pd.DataFrame, prof: pd.DataFrame) -> (pd.DataFrame, pd.DataFram
         col = out[c]
         before_nonnull = int(col.notna().sum())
 
-        # normalize NA-like strings & whitespace for objects
         if col.dtype == "object":
             col = col.astype(str).map(norm_str)
             col = col.mask(col.str.lower().isin(NA_STRINGS))
-            actions.append((c, "normalize_text", "trim, NFKC, drop NA-like strings"))
+            actions.append((c, "normalize_text", "trim, NFKC, drop NA-like"))
 
-        # parse dates
-        if "date" in (prof.loc[prof["column"]==c, "tags"].values[0] or ""):
+        tags = (prof.loc[prof["column"] == c, "tags"].values[0] or "")
+
+        if "date" in tags:
             col = pd.to_datetime(col, errors="coerce")
             actions.append((c, "parse_date", "to_datetime"))
-
-        # emails
-        if "email" in (prof.loc[prof["column"]==c, "tags"].values[0] or ""):
+        if "email" in tags:
             col = col.str.lower().where(col.str.match(EMAIL_RE, na=False), np.nan)
             actions.append((c, "validate_email", "lower + regex"))
-
-        # phones
-        if "phone" in (prof.loc[prof["column"]==c, "tags"].values[0] or ""):
+        if "phone" in tags:
             def fmt(x):
                 if pd.isna(x): return np.nan
                 d = PHONE_DIGITS.sub("", str(x))
@@ -205,22 +193,18 @@ def clean_df(df: pd.DataFrame, prof: pd.DataFrame) -> (pd.DataFrame, pd.DataFram
                 return np.nan
             col = col.apply(fmt)
             actions.append((c, "validate_phone", "US 10/11-digit"))
-
-        # ZIPs
-        if "zip" in (prof.loc[prof["column"]==c, "tags"].values[0] or ""):
+        if "zip" in tags:
             col = col.astype(str).str.extract(ZIP_RE)[0]
             actions.append((c, "normalize_zip", "extract 5-digit"))
-
-        # lat/lon bounds
-        if "latitude" in (prof.loc[prof["column"]==c, "tags"].values[0] or ""):
+        if "latitude" in tags:
             col = pd.to_numeric(col, errors="coerce").where(lambda x: x.between(-90, 90))
             actions.append((c, "bound_lat", "[-90, 90]"))
-        if "longitude" in (prof.loc[prof["column"]==c, "tags"].values[0] or ""):
+        if "longitude" in tags:
             col = pd.to_numeric(col, errors="coerce").where(lambda x: x.between(-180, 180))
             actions.append((c, "bound_lon", "[-180, 180]"))
 
-        # numeric-like coercion (currency/percent/number)
-        if prof.loc[prof["column"]==c, "numeric_rate"].values[0] >= 0.9 and "date" not in (prof.loc[prof["column"]==c, "tags"].values[0] or ""):
+        # numeric-like coercion
+        if prof.loc[prof["column"]==c, "numeric_rate"].values[0] >= 0.9 and "date" not in tags:
             col = parse_numeric_like(col)
             actions.append((c, "coerce_numeric", "currency/percent/number → float"))
 
@@ -229,18 +213,15 @@ def clean_df(df: pd.DataFrame, prof: pd.DataFrame) -> (pd.DataFrame, pd.DataFram
         if before_nonnull != after_nonnull:
             actions.append((c, "null_change", f"non-null {before_nonnull} → {after_nonnull}"))
 
-    # drop perfect duplicates
     before_rows = len(out)
     out = out.drop_duplicates()
     if len(out) != before_rows:
         actions.append(("*all*", "drop_duplicates", f"{before_rows - len(out)} removed"))
 
-    act_df = pd.DataFrame(actions, columns=["column","action","details"])
-    if act_df.empty:
-        act_df = pd.DataFrame([{"column":"(none)","action":"no-op","details":"no cleaning rules applied"}])
+    act_df = pd.DataFrame(actions, columns=["column","action","details"]) or pd.DataFrame([{"column":"(none)","action":"no-op","details":"no rules"}])
     return out, act_df
 
-# ---------- Autopilot choices ----------
+# ---------- choices for dashboard ----------
 def choose_best(prof: pd.DataFrame, df: pd.DataFrame):
     date = None
     cand = prof[prof["tags"].str.contains("date", na=False)]
@@ -292,7 +273,7 @@ show_df(prof[["column","dtype","missing_%","unique_vals","tags","example"]], "Co
 
 st.subheader("2) Cleaning (content-aware)")
 clean, clean_log = clean_df(raw, prof)
-st.success("Done: normalized text & NA values, parsed dates, validated email/phone/ZIP, coerced numeric (currency/percent), bounded lat/lon, removed duplicates.")
+st.success("Trimmed text/NA, parsed dates, validated email/phone/ZIP, coerced numeric (currency/percent), bounded lat/lon, removed duplicates.")
 with st.expander("Cleaning Summary (what I did)"):
     show_df(clean_log, "Cleaning actions")
 with st.expander("Preview cleaned data"):
@@ -307,7 +288,7 @@ if up_ext:
     right_key = st.selectbox("Choose the matching column in the EXTERNAL data", options=list(ext.columns))
     if st.button("Join the files", type="primary"):
         work = work.merge(ext.rename(columns={right_key:left_key}), on=left_key, how="left")
-        st.success(f"Joined on “{left_key}”.")
+        st.success(f"Joined on \"{left_key}\".")
         with st.expander("Preview joined data"):
             show_df(work.head(200), "Preview")
 
@@ -319,17 +300,17 @@ st.subheader("4) Filters (optional)")
 filtered = work.copy()
 
 # Date
-if choice["date"] and filtered[choice["date"]].notna().any():
+if choice["date"] and filtered.get(choice["date"]) is not None and filtered[choice["date"]].notna().any():
     dmin = pd.to_datetime(filtered[choice["date"]], errors="coerce").min()
     dmax = pd.to_datetime(filtered[choice["date"]], errors="coerce").max()
     if pd.notna(dmin) and pd.notna(dmax):
         start, end = st.date_input("Date range", value=(dmin.date(), dmax.date()))
-        filtered = filtered[(pd.to_datetime(filtered[choice["date"]], errors="coerce") >= pd.to_datetime(start)) &
-                            (pd.to_datetime(filtered[choice["date"]], errors="coerce") <= pd.to_datetime(end))]
+        mask = pd.to_datetime(filtered[choice["date"]], errors="coerce").between(pd.to_datetime(start), pd.to_datetime(end), inclusive="both")
+        filtered = filtered[mask]
 else:
     st.caption("No clear date column detected — skipping date filter.")
 
-# Category chips
+# Category filters
 cat_cols = choice["cat_list"]
 if cat_cols:
     with st.expander("Category filters"):
@@ -356,7 +337,6 @@ if st.button("Reset all filters"):
     st.session_state.clear()
     st.experimental_rerun()
 
-# If filters wiped everything, fallback to full dataset (so the dashboard isn’t empty)
 if len(filtered) == 0:
     st.warning("All rows were filtered out. Showing the full dataset so charts aren’t empty.")
     filtered = work.copy()
@@ -372,29 +352,30 @@ with st.expander("See the data we’re charting"):
     show_df(filtered.head(200), "Preview")
 
 # Time series
-if choice["date"] and filtered[choice["date"]].notna().any():
+if choice["date"] and filtered.get(choice["date"]) is not None and filtered[choice["date"]].notna().any():
     ts = filtered[[choice["date"]]].dropna().copy()
     ts["month"] = pd.to_datetime(ts[choice["date"]]).dt.to_period("M").dt.to_timestamp()
     ts = ts.groupby("month").size().reset_index(name="count")
     st.plotly_chart(px.line(ts, x="month", y="count", title="Activity over time"), use_container_width=True)
 
 # Top category
-if choice["cat"] and filtered[choice["cat"]].notna().any():
+if choice["cat"] and filtered.get(choice["cat"]) is not None and filtered[choice["cat"]].notna().any():
     topc = filtered[choice["cat"]].value_counts().head(12).reset_index()
     topc.columns = [choice["cat"], "count"]
     st.plotly_chart(px.bar(topc, x=choice["cat"], y="count", title=f"Top values — {choice['cat']}"), use_container_width=True)
 
 # Numeric distribution
-if choice["num"] and is_numeric_dtype(filtered[choice["num"]]) and filtered[choice["num"]].notna().any():
+if choice["num"] and filtered.get(choice["num"]) is not None and is_numeric_dtype(filtered[choice["num"]]) and filtered[choice["num"]].notna().any():
     st.plotly_chart(px.histogram(filtered, x=choice["num"], nbins=30, title=f"Distribution — {choice['num']}"), use_container_width=True)
 
-# Correlation
+# Correlation (cap numerics so heatmap payload is small)
 num_cols_all = [c for c in filtered.columns if is_numeric_dtype(filtered[c]) and filtered[c].notna().any()]
 if len(num_cols_all) >= 2:
+    num_cols_all = num_cols_all[:MAX_NUMERIC_FOR_CORR]
     corr = filtered[num_cols_all].corr(numeric_only=True)
     st.plotly_chart(px.imshow(corr, text_auto=True, title="Numbers that move together"), use_container_width=True)
 
-# Map — lat/lon or ZIP centroid fallback (with caps/heatmap for big datasets)
+# Map — lat/lon or ZIP centroid fallback (cluster/heatmap, capped)
 st.subheader("Map")
 lat_c, lon_c, zip_c = choice["lat"], choice["lon"], choice["zip"]
 
@@ -408,11 +389,10 @@ def render_point_map(points_df, lat_col, lon_col):
     if n > MAX_MARKERS and n < HEATMAP_AT:
         pts = pts.head(MAX_MARKERS)
         n = len(pts)
-    # Build map
     m = folium.Map(location=[pts[lat_col].mean(), pts[lon_col].mean()], zoom_start=8, prefer_canvas=True)
     if n >= HEATMAP_AT:
-        HeatMap(pts[[lat_col, lon_col]].values.tolist(), radius=8, blur=12).add_to(m)
-        st.caption(f"Heatmap shown for {n:,} points")
+        HeatMap(pts[[lat_col, lon_col]].values[:HEATMAP_CAP].tolist(), radius=8, blur=12).add_to(m)
+        st.caption(f"Heatmap shown for {n:,} points (capped for performance)")
     else:
         cluster = MarkerCluster().add_to(m)
         for _, r in pts.iterrows():
@@ -432,9 +412,7 @@ elif zip_c and filtered.get(zip_c) is not None and filtered[zip_c].notna().any()
         if not zz.empty:
             m = folium.Map(location=[zz["lat"].mean(), zz["lon"].mean()], zoom_start=7, prefer_canvas=True)
             for _, r in zz.iterrows():
-                folium.Circle(location=[r["lat"], r["lon"]],
-                              radius=200 + 50*float(r["count"]),
-                              popup=f"ZIP {r['zip']}: {int(r['count'])}").add_to(m)
+                folium.Circle(location=[r["lat"], r["lon"]], radius=200 + 50*float(r["count"]), popup=f"ZIP {r['zip']}: {int(r['count'])}").add_to(m)
             st_html(m._repr_html_(), height=520)
         else:
             st.info("Couldn’t look up ZIP locations for mapping.")
@@ -443,7 +421,7 @@ elif zip_c and filtered.get(zip_c) is not None and filtered[zip_c].notna().any()
 else:
     st.caption("No location fields yet — add a ZIP column or lat/lon for a map.")
 
-# Ask a question
+# Ask a question (simple patterns)
 st.subheader("6) Ask a question")
 st.caption("Click a suggestion or type your own in plain English. (No coding.)")
 chips = []
@@ -513,7 +491,6 @@ def build_report(df: pd.DataFrame, choice) -> str:
         dmin = pd.to_datetime(df[choice["date"]]).min().date()
         dmax = pd.to_datetime(df[choice["date"]]).max().date()
         lines.append(f"**Date span ({choice['date']}):** {dmin} → {dmax}")
-    # top of first few low-cardinality columns
     small_cats = [c for c in df.columns if (df[c].dtype == "object" or is_categorical_dtype(df[c])) and df[c].nunique(dropna=True) <= 50]
     for c in small_cats[:3]:
         top = df[c].value_counts().head(5)
@@ -521,9 +498,9 @@ def build_report(df: pd.DataFrame, choice) -> str:
             lines.append(f"\n**Top `{c}`:**")
             for k, v in top.items():
                 lines.append(f"- {k}: {v}")
-    # numeric summary
     nums = [c for c in df.columns if is_numeric_dtype(df[c])]
     if nums:
+        nums = nums[:MAX_NUMERIC_FOR_CORR]
         desc = df[nums].describe().T.round(2)
         try:
             import tabulate  # pretty markdown if available
