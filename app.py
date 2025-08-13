@@ -1,15 +1,7 @@
-# app.py
+
 # Streamlit Analytics App for a Nonprofit Legal Aid Organization — Schema Wizard Edition
 # -------------------------------------------------------------------------------------
-# Run locally (safe in a separate env): streamlit run app.py
-# Features:
-# - Upload any CSV/Excel (unknown headers OK)
-# - Schema Wizard to map your file's columns → standard roles (department, opened_date, zip, etc.)
-# - Automatic cleaning by role (dates, phone, email, ZIP, categoricals)
-# - Optional external data join (pick external join column + internal role)
-# - Interactive dashboards: trends, issues/events, outcomes, demographics
-# - Maps: points (lat/long) and ZIP hotspots via centroids
-# - Download filtered CSV
+# Run locally (in an isolated env): streamlit run app.py
 
 import io
 import json
@@ -113,7 +105,7 @@ ZIP_RE = re.compile(r"^(\d{5})(?:-\d{4})?$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # -------------------------
-# Loaders & Cleaners
+# Loaders & Mapping Suggestions
 # -------------------------
 @st.cache_data(show_spinner=False)
 def load_df(file) -> pd.DataFrame:
@@ -134,14 +126,14 @@ def suggest_mapping(columns: List[str]):
         for c, n in norm_cols.items():
             if n == _norm(role) or n.replace(" ", "_") == role:
                 suggestions[role] = c; break
-        if role in suggestions: 
+        if role in suggestions:
             continue
         # synonym
         for syn in ROLE_SYNONYMS.get(role, []):
             for c, n in norm_cols.items():
                 if n == _norm(syn):
                     suggestions[role] = c; break
-            if role in suggestions: 
+            if role in suggestions:
                 break
         # optional fuzzy
         if not role in suggestions and HAS_FUZZ:
@@ -152,7 +144,9 @@ def suggest_mapping(columns: List[str]):
                         suggestions[role] = c; break
     return suggestions
 
+# -------------------------
 # Cleaning helpers
+# -------------------------
 def to_date(s): return pd.to_datetime(s, errors="coerce")
 def to_num(s, lo=None, hi=None):
     s = pd.to_numeric(s, errors="coerce")
@@ -218,6 +212,15 @@ def apply_mapping_and_clean(df: pd.DataFrame, role_map: Dict[str,str], cleaning=
     issues["unmapped_roles"] = [r for r in STANDARD_ROLES if not role_map.get(r)]
     return unified, issues
 
+@st.cache_data(show_spinner=False)
+def filter_df(df: pd.DataFrame, dept: str, date_field: str, start_date: datetime, end_date: datetime):
+    out = df.copy()
+    if dept and dept != "All Departments" and "department" in out.columns:
+        out = out[out["department"] == dept]
+    if date_field in out.columns:
+        out = out[(out[date_field] >= pd.to_datetime(start_date)) & (out[date_field] <= pd.to_datetime(end_date))]
+    return out
+
 # -------------------------
 # Sidebar
 # -------------------------
@@ -248,7 +251,13 @@ role_map: Dict[str, str] = {}
 issues_report = {}
 
 if up:
-    raw_df = load_df(up)
+    # Read internal file
+    try:
+        raw_df = load_df(up)
+    except Exception as e:
+        st.error(f"Could not read the internal file: {e}")
+        st.stop()
+
     st.subheader("Schema Wizard: Map Your Columns")
     st.caption("We suggested matches below. Adjust any dropdowns where needed — unmapped roles are skipped.")
 
@@ -274,11 +283,11 @@ if up:
 # External wizard
 ext_join_key = None
 if up_ext:
-    external_df = pd.DataFrame()
     try:
         external_df = load_df(up_ext)
     except Exception as e:
         st.warning(f"Could not read external file: {e}")
+        external_df = pd.DataFrame()
     if not external_df.empty:
         st.subheader("External Data Wizard")
         st.caption("Pick external join column and the internal key (zip/county/state) to enrich your data.")
@@ -307,20 +316,10 @@ if internal_df is not None:
         with st.expander("See details"):
             st.json(issues_report)
 
-@st.cache_data(show_spinner=False)
-def filter_df(df: pd.DataFrame, dept: str, date_field: str, start_date: datetime, end_date: datetime):
-    out = df.copy()
-    if dept and dept != "All Departments" and "department" in out.columns:
-        out = out[out["department"] == dept]
-    if date_field in out.columns:
-        out = out[(out[date_field] >= pd.to_datetime(start_date)) & (out[date_field] <= pd.to_datetime(end_date))]
-    return out
-
-if internal_df is not None:
+    # Build working dataframe with filters and optional external join
     work_df = filter_df(internal_df, dept, date_field, start_date, end_date)
 
-    # Join external if configured
-    if up_ext and ext_join_key is not None and 'external_df' in locals() and not external_df.empty:
+    if external_df is not None and ext_join_key is not None and not external_df.empty:
         ext_col, int_role = ext_join_key
         if int_role in work_df.columns and ext_col in external_df.columns:
             tmp_ext = external_df.rename(columns={ext_col: int_role})
