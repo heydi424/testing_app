@@ -1,0 +1,7 @@
+[client]
+showErrorDetails = true
+
+[server]
+# cap really big websocket frames from UI to safer sizes
+maxUploadSize = 200
+maxMessageSize = 200
