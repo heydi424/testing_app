@@ -2,11 +2,20 @@
 # Streamlit Analytics App for a Nonprofit Legal Aid Organization — Schema Wizard Edition
 # -------------------------------------------------------------------------------------
 # Run:  streamlit run app.py
+# Features:
+# - Upload any CSV/Excel (unknown headers OK)
+# - Schema Wizard to map your file's columns → standard roles (department, opened_date, zip, etc.)
+# - Automatic cleaning by role (dates, phone, email, ZIP, categoricals)
+# - Optional external data join (pick external join column + internal role)
+# - Interactive dashboards: trends, issues/events, outcomes, demographics
+# - Maps: points (lat/long) and ZIP hotspots via centroids
+# - Download filtered CSV
 
 import io
+import json
 import re
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,13 +30,6 @@ try:
     HAS_FUZZ = True
 except Exception:
     HAS_FUZZ = False
-
-# ZIP → lat/lon centroid lookup (offline)
-try:
-    import pgeocode
-    HAS_PGEO = True
-except Exception:
-    HAS_PGEO = False
 
 st.set_page_config(page_title="Legal Aid Analytics", page_icon="⚖️", layout="wide")
 
@@ -112,7 +114,7 @@ PHONE_DIGITS_RE = re.compile(r"\D+")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # -------------------------
-# Loaders & Mapping Suggestions
+# Loaders & Cleaners
 # -------------------------
 @st.cache_data(show_spinner=False)
 def load_df(file) -> pd.DataFrame:
@@ -134,27 +136,24 @@ def suggest_mapping(columns: List[str]):
         for c, n in norm_cols.items():
             if n == _norm(role) or n.replace(" ", "_") == role:
                 suggestions[role] = c; break
-        if role in suggestions:
-            continue
+        if role in suggestions: continue
         # synonym
         for syn in ROLE_SYNONYMS.get(role, []):
             for c, n in norm_cols.items():
                 if n == _norm(syn):
                     suggestions[role] = c; break
-            if role in suggestions:
-                break
-        # optional fuzzy
-        if not role in suggestions and HAS_FUZZ:
-            best = fuzz_process.extractOne(role, list(norm_cols.values()))
-            if best and best[1] >= 85:
-                for c, n in norm_cols.items():
-                    if n == best[0]:
-                        suggestions[role] = c; break
+            if role in suggestions: break
+        if role in suggestions or not HAS_FUZZ: continue
+        # fuzzy
+        best = fuzz_process.extractOne(role, list(norm_cols.values()))
+        if best and best[1] >= 85:
+            for c, n in norm_cols.items():
+                if n == best[0]:
+                    suggestions[role] = c; break
     return suggestions
 
-# -------------------------
 # Cleaning helpers
-# -------------------------
+
 def to_date(s): return pd.to_datetime(s, errors="coerce")
 
 def to_num(s, lo=None, hi=None):
@@ -164,8 +163,7 @@ def to_num(s, lo=None, hi=None):
     return s
 
 def clean_zip(s):
-    """
-    Normalize ZIP codes to strict 5-digit strings with no commas or decimals.
+    """Normalize ZIP codes to strict 5-digit strings with no commas or decimals.
     - Remove all non-digits
     - Keep the first 5 digits (ZIP+4 → ZIP5)
     - Left-pad to 5 if Excel dropped a leading zero
@@ -214,6 +212,60 @@ OPS = {
     "text_trim": lambda s,c: trim(s),
 }
 
+# Ensure columns have sensible Python/Pandas dtypes regardless of the source file
+# - ZIP as strict 5-character STRING (leading zeros preserved)
+# - IDs, phones, emails, addresses as STRING
+# - Dates as datetime64
+# - Numeric fields coerced to numeric with bounds
+# - Common categorical text columns cast to category for performance
+
+def finalize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # ZIP first (string, 5 digits)
+    if "zip" in df.columns:
+        df["zip"] = clean_zip(df["zip"]).astype("string")
+
+    # String-like identifiers & contact info
+    for col in [
+        "client_id","phone","email","address",
+        "city","county","state","language","department",
+        "legal_issue","event_type","outcome","referral_source",
+        "race_ethnicity","gender"
+    ]:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
+
+    # Dates
+    for col in ["opened_date","closed_date","event_date"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    # Numeric with bounds
+    bounds = {
+        "income_pct_fpl": (0, 600),
+        "age": (0, 120),
+        "latitude": (-90, 90),
+        "longitude": (-180, 180),
+    }
+    for col, (lo, hi) in bounds.items():
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if lo is not None:
+                df[col] = df[col].where(df[col] >= lo)
+            if hi is not None:
+                df[col] = df[col].where(df[col] <= hi)
+
+    # Cast common low-cardinality text to category
+    for col in [
+        "department","language","city","county","state",
+        "legal_issue","event_type","outcome","referral_source",
+        "race_ethnicity","gender"
+    ]:
+        if col in df.columns and df[col].nunique(dropna=True) <= 1000:
+            df[col] = df[col].astype("category")
+
+    return df
+
 @st.cache_data(show_spinner=False)
 def apply_mapping_and_clean(df: pd.DataFrame, role_map: Dict[str,str], cleaning=DEFAULT_ROLE_CLEANING):
     df = df.copy()
@@ -243,22 +295,6 @@ def apply_mapping_and_clean(df: pd.DataFrame, role_map: Dict[str,str], cleaning=
     issues["unmapped_roles"] = [r for r in STANDARD_ROLES if not role_map.get(r)]
     return unified, issues
 
-# ZIP → lat/lon centroid lookup
-def zip_centroids(zip_series: pd.Series) -> pd.DataFrame:
-    if not HAS_PGEO:
-        return pd.DataFrame(columns=["zip","lat","lon"])
-    z = clean_zip(zip_series).dropna().unique().tolist()
-    if not z:
-        return pd.DataFrame(columns=["zip","lat","lon"])
-    nomi = pgeocode.Nominatim("us")
-    res = nomi.query_postal_code(z)
-    if res is None or len(res) == 0:
-        return pd.DataFrame(columns=["zip","lat","lon"])
-    df = pd.DataFrame(res)
-    df = df.rename(columns={"postal_code":"zip","latitude":"lat","longitude":"lon"})
-    df["zip"] = df["zip"].astype(str).str.zfill(5)
-    return df[["zip","lat","lon"]]
-
 # -------------------------
 # Sidebar
 # -------------------------
@@ -273,7 +309,7 @@ with st.sidebar.expander("2) Upload External Data (optional)"):
 
 with st.sidebar.expander("Filters", expanded=True):
     dept = st.selectbox("Department", options=DEPT_OPTIONS, index=0)
-    date_field = st.selectbox("Date field", options=["opened_date","event_date","closed_date"])
+    date_field = st.selectbox("Date field", options=["opened_date","event_date","closed_date"]) 
     start_date = st.date_input("Start", value=pd.to_datetime("2023-01-01").date())
     end_date = st.date_input("End", value=pd.to_datetime("today").date())
 
@@ -308,8 +344,10 @@ if up:
 
     if st.button("Apply Mapping & Clean Data", type="primary"):
         internal_df, issues_report = apply_mapping_and_clean(raw_df, map_cols)
+        # Enforce sensible dtypes (ZIP as string, dates/nums parsed, etc.)
+        internal_df = finalize_dtypes(internal_df)
         role_map = map_cols
-        st.success("Mapping applied — data cleaned.")
+        st.success("Mapping applied — data cleaned and dtypes standardized (ZIP as string).")
         st.json(issues_report)
 
 # External wizard
@@ -350,20 +388,26 @@ def filter_df(df: pd.DataFrame, dept: str, date_field: str, start_date: datetime
     - Skips the date filter if the column is missing or has no valid dates.
     """
     out = df.copy()
+    # Department filter
     if dept and dept != "All Departments" and "department" in out.columns:
         out = out[out["department"].astype(str) == dept]
+
+    # Date filter (robust coercion)
     if date_field in out.columns:
-        dates = pd.to_datetime(out[date_field], errors="coerce")
+        dates = pd.to_datetime(out[date_field], errors="coerce")  # invalid → NaT
         if dates.notna().any():
             start_ts = pd.to_datetime(start_date)
             end_ts = pd.to_datetime(end_date)
             mask = dates.between(start_ts, end_ts, inclusive="both")
             out = out[mask]
+        # else: no valid dates, skip silently
+    # else: date field not present, skip
     return out
 
 if internal_df is not None:
     work_df = filter_df(internal_df, dept, date_field, start_date, end_date)
 
+    # Join external if configured
     if external_df is not None and ext_join_key is not None:
         ext_col, int_role = ext_join_key
         if int_role in work_df.columns and ext_col in external_df.columns:
@@ -389,6 +433,7 @@ if internal_df is not None:
     st.subheader("Trends & Breakdown")
     ch1, ch2 = st.columns(2)
 
+    # Time series by month
     if date_field in work_df.columns:
         tmp = work_df[[date_field]].dropna().copy()
         if not tmp.empty:
@@ -397,6 +442,7 @@ if internal_df is not None:
             with ch1:
                 st.plotly_chart(px.line(ts, x="month", y="count", title=f"Records per month ({date_field})"), use_container_width=True)
 
+    # Top legal issues or event types
     with ch2:
         if "legal_issue" in work_df.columns and work_df["legal_issue"].notna().any():
             top_issues = work_df["legal_issue"].fillna("Unknown").value_counts().head(10).reset_index()
@@ -407,6 +453,7 @@ if internal_df is not None:
             top_ev.columns = ["event_type","count"]
             st.plotly_chart(px.bar(top_ev, x="event_type", y="count", title="Top Outreach Event Types"), use_container_width=True)
 
+    # Outcomes by department
     if "outcome" in work_df.columns and "department" in work_df.columns:
         st.subheader("Outcomes by Department")
         ob = work_df.groupby(["department","outcome"], dropna=False).size().reset_index(name="count")
@@ -440,14 +487,11 @@ if internal_df is not None:
 
     with tabs[0]:
         if {"latitude","longitude"}.issubset(work_df.columns) and work_df[["latitude","longitude"]].notna().any().any():
-            pts = work_df.dropna(subset=["latitude","longitude"])
+            pts = work_df.dropna(subset=["latitude","longitude"]) 
             if not pts.empty:
                 m = folium.Map(location=[pts["latitude"].mean(), pts["longitude"].mean()], zoom_start=9)
                 for _, r in pts.iterrows():
-                    popup = folium.Popup(
-                        f"Dept: {r.get('department','')}<br>Issue: {r.get('legal_issue','')}<br>Date: {r.get(date_field,'')}",
-                        max_width=300
-                    )
+                    popup = folium.Popup(f"Dept: {r.get('department','')}<br>Issue: {r.get('legal_issue','')}<br>Date: {r.get(date_field,'')}", max_width=300)
                     folium.CircleMarker([r["latitude"], r["longitude"]], radius=4, popup=popup).add_to(m)
                 st_html(m._repr_html_(), height=500)
         else:
@@ -455,43 +499,27 @@ if internal_df is not None:
 
     with tabs[1]:
         if "zip" in work_df.columns and work_df["zip"].notna().any():
+            # Ensure ZIPs are strict 5-digit strings before aggregating/mapping
             z_df = work_df.copy()
-            z_df["zip"] = clean_zip(z_df["zip"])   # strict 5-digit strings
-            z_df = z_df.dropna(subset=["zip"])
+            z_df["zip"] = clean_zip(z_df["zip"])  # enforces 5-digit strings
+            z_df = z_df.dropna(subset=["zip"])      # drop invalid ZIPs
             if not z_df.empty:
                 zc = z_df.groupby("zip").size().reset_index(name="count")
                 if {"latitude","longitude"}.issubset(z_df.columns) and z_df[["latitude","longitude"]].notna().any().any():
-                    cent = z_df.dropna(subset=["zip","latitude","longitude"]).groupby("zip")[["latitude","longitude"]].mean().reset_index()
-                    zz = zc.merge(cent, on="zip", how="left").dropna(subset=["latitude","longitude"])
+                    cent = z_df.dropna(subset=["zip","latitude","longitude"]).groupby("zip")[['latitude','longitude']].mean().reset_index()
+                    zz = zc.merge(cent, on="zip", how="left").dropna(subset=["latitude","longitude"]) 
                     if not zz.empty:
                         m2 = folium.Map(location=[zz["latitude"].mean(), zz["longitude"].mean()], zoom_start=8)
                         for _, r in zz.iterrows():
                             folium.Circle(
-                                location=[r["latitude"], r["longitude"]],
-                                radius=300,
+                                location=[r["latitude"], r["longitude"]], radius=300,
                                 popup=folium.Popup(f"ZIP {r['zip']}: {r['count']} records", max_width=200)
                             ).add_to(m2)
                         st_html(m2._repr_html_(), height=500)
                     else:
                         st.info("Need some lat/long values to plot ZIP centroids.")
                 else:
-                    # ZIP centroid fallback (no lat/lon in your data)
-                    if HAS_PGEO:
-                        geo = zip_centroids(z_df["zip"])     # zip, lat, lon
-                        zz = zc.merge(geo, on="zip", how="left").dropna(subset=["lat","lon"])
-                        if not zz.empty:
-                            m3 = folium.Map(location=[zz["lat"].mean(), zz["lon"].mean()], zoom_start=7)
-                            for _, r in zz.iterrows():
-                                folium.Circle(
-                                    location=[r["lat"], r["lon"]],
-                                    radius=200 + 50*float(r["count"]),
-                                    popup=folium.Popup(f"ZIP {r['zip']}: {int(r['count'])} records", max_width=220)
-                                ).add_to(m3)
-                            st_html(m3._repr_html_(), height=500)
-                        else:
-                            st.info("Couldn’t look up ZIP locations for mapping.")
-                    else:
-                        st.warning("ZIP-only map requires 'pgeocode'. Add it to requirements.txt (pgeocode==0.5.0) and reboot.")
+                    st.dataframe(zc)
             else:
                 st.info("No valid 5-digit ZIPs after cleaning.")
         else:
@@ -512,23 +540,23 @@ if internal_df is not None:
 with st.expander("ℹ️ Setup & Tips"):
     st.markdown(
         """
-        **Install & run**
-        1. Python 3.10+
-        2. `pip install streamlit pandas numpy plotly folium openpyxl rapidfuzz pgeocode`
+        **Install & run**  
+        1. Python 3.10+  
+        2. `pip install streamlit pandas numpy plotly folium openpyxl rapidfuzz` *(rapidfuzz optional)*  
         3. `streamlit run app.py`
 
-        **Unknown columns?**
-        - Use the *Schema Wizard* to map headers to roles like `opened_date`, `zip`, `department`.
+        **Unknown columns?**  
+        - Use the *Schema Wizard* to map headers to roles like `opened_date`, `zip`, `department`.  
         - Unmapped roles are safely ignored.
 
-        **External data**
+        **External data**  
         - Upload any CSV/Excel (e.g., Census indicators). Choose its join column (e.g., `ZipCode`) and the internal key (`zip`/`county`/`state`).
 
-        **Maps**
-        - If your file has latitude & longitude, you'll get a point map.
-        - If not, ZIP-only hotspot maps work via ZIP centroids.
+        **Maps**  
+        - Provide `latitude` & `longitude` in your data for point maps.  
+        - For true boundary choropleths (ZIP/tract), we can add GeoJSON support next.
 
-        **Privacy**
-        - Handle PII according to your policies.
+        **Privacy**  
+        - Runs locally. Handle PII according to your policies.
         """
     )
